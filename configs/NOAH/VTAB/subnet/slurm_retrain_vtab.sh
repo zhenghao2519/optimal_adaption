@@ -26,7 +26,7 @@ for LR in 0.001
 do  
     # for DATASET in cifar100 caltech101 dtd oxford_flowers102 svhn sun397 oxford_pet patch_camelyon eurosat resisc45 diabetic_retinopathy clevr_count clevr_dist dmlab kitti dsprites_loc dsprites_ori smallnorb_azi smallnorb_ele #
     # for DATASET in caltech101 dtd oxford_flowers102 svhn sun397 oxford_pet patch_camelyon eurosat resisc45 diabetic_retinopathy clevr_count clevr_dist dmlab kitti dsprites_loc dsprites_ori smallnorb_azi smallnorb_ele
-    for DATASET in caltech101
+    for DATASET in diabetic_retinopathy dsprites_ori smallnorb_azi
     do
         export MASTER_PORT=$((12000 + $RANDOM % 20000))
         srun -p ${PARTITION} \
