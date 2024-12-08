@@ -231,9 +231,14 @@ class Attention(nn.Module):
             nn.init.zeros_(self.LoRA_b.weight)
 
             if add_lora_gate:
-                self.loRA_gate = nn.Linear(dim, num_heads)
+                self.loRA_gate_q = nn.Linear(dim, num_heads)
+                self.loRA_gate_k = nn.Linear(dim, num_heads)
+                self.loRA_gate_v = nn.Linear(dim, num_heads)
+
                 # initialize gate with mean 0 and std 0.02
-                nn.init.normal_(self.loRA_gate.weight, std=0.02, mean=0)
+                nn.init.normal_(self.loRA_gate_q.weight, std=0.02, mean=0)
+                nn.init.normal_(self.loRA_gate_k.weight, std=0.02, mean=0)
+                nn.init.normal_(self.loRA_gate_v.weight, std=0.02, mean=0)
                 
 
         # prefix setting
@@ -297,19 +302,31 @@ class Attention(nn.Module):
                 
                 # print("lora input shape",x.shape,)
                 # loRA_gate_input shape (B,len_seq, num_heads)
-                self.lora_scaling = torch.sigmoid(self.loRA_gate(x))
+                self.lora_scaling_q = torch.sigmoid(self.loRA_gate_q(x))
+                self.lora_scaling_k = torch.sigmoid(self.loRA_gate_k(x))
+                self.lora_scaling_v = torch.sigmoid(self.loRA_gate_v(x))
 
                 # reshape lora gate to (B, num_heads, len_seq,1)
-                self.lora_scaling = self.lora_scaling.unsqueeze(-1).transpose(1,2)
-                # mean gate for each gate
-                self.lora_scaling = self.lora_scaling.mean(dim=2).unsqueeze(-1) # shape (B,1,1)
+                # self.lora_scaling = self.lora_scaling.unsqueeze(-1).transpose(1,2)
+                self.lora_scaling_q  = self.lora_scaling_q.unsqueeze(-1).transpose(1,2)
+                self.lora_scaling_k  = self.lora_scaling_k.unsqueeze(-1).transpose(1,2)
+                self.lora_scaling_v  = self.lora_scaling_v.unsqueeze(-1).transpose(1,2)
 
-                print("lora_gate called with gate value", self.lora_scaling.shape, q_delta.shape, self.lora_scaling.max().item(), self.lora_scaling.min().item(),self.lora_scaling.squeeze(-1).squeeze(-1),)
+                # mean gate for each gate
+                # self.lora_scaling = self.lora_scaling.mean(dim=2).unsqueeze(-1) # shape (B,Head,1,1)
+                self.lora_scaling_q = self.lora_scaling_q.mean(dim=2).unsqueeze(-1) # shape (B,Head,1,1)
+                self.lora_scaling_k = self.lora_scaling_k.mean(dim=2).unsqueeze(-1) # shape (B,Head,1,1)
+                self.lora_scaling_v = self.lora_scaling_v.mean(dim=2).unsqueeze(-1) # shape (B,Head,1,1)
+
+                print("q lora_gate called with gate value", self.lora_scaling_q.shape, self.lora_scaling_q.max().item(), self.lora_scaling_q.min().item(),self.lora_scaling_q.squeeze(-1).squeeze(-1),)
+                print("k lora_gate called with gate value", self.lora_scaling_k.shape, self.lora_scaling_k.max().item(), self.lora_scaling_k.min().item(),self.lora_scaling_k.squeeze(-1).squeeze(-1),)
+                print("v lora_gate called with gate value", self.lora_scaling_v.shape, self.lora_scaling_v.max().item(), self.lora_scaling_v.min().item(),self.lora_scaling_v.squeeze(-1).squeeze(-1),)
+
                 # print('lora_scaling shape',self.lora_scaling.shape, 'q_delta shape',q_delta.shape)
-                q_delta,k_delta,v_delta = q_delta*self.lora_scaling,k_delta*self.lora_scaling,v_delta*self.lora_scaling
+                q_delta,k_delta,v_delta = q_delta*self.lora_scaling_q,k_delta*self.lora_scaling_k,v_delta*self.lora_scaling_v
                 
             q,k,v = q+q_delta,k+k_delta,v+v_delta
-
+            # only update q,k
         if self.prefix_identity == False:
             prefix_weight_key = self.prefix_weight_key.expand(B,-1,-1)
             prefix_weight_value = self.prefix_weight_value.expand(B,-1,-1)
