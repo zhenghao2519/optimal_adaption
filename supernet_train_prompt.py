@@ -224,6 +224,9 @@ def get_args_parser():
     # sequential adapter or parallel adapter
     parser.add_argument('--parallel_adapter',action='store_true')
     parser.add_argument('--sequential_adapter',action='store_true')
+    
+    # router setting
+    parser.add_argument('--router',action='store_true')
     return parser
 
 def main(args):
@@ -317,6 +320,7 @@ def main(args):
                                                 add_vpt_gate=args.add_vpt_gate,
                                                 sequential_adapter=args.sequential_adapter,
                                                 parallel_adapter=args.parallel_adapter,
+                                                add_router=args.router,
                                                 )
 
     choices = {'depth': cfg.SUPERNET.DEPTH,

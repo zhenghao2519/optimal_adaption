@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from model.utils import to_2tuple
 import numpy as np
 
+torch.set_printoptions(threshold=150, edgeitems=10)
 
 class QuickGELU(nn.Module):
     def forward(self, x: torch.Tensor):
@@ -11,7 +12,8 @@ class QuickGELU(nn.Module):
 
 class AdapterSuper(nn.Module):
     def __init__(self,
-                 embed_dims,
+                 embed_dims_in,
+                 embed_dims_out,
                  reduction_dims,
                  drop_rate_adapter=0,
                  add_adapter_gate=False,
@@ -20,7 +22,8 @@ class AdapterSuper(nn.Module):
                         ):
         super(AdapterSuper, self).__init__()
     
-        self.embed_dims = embed_dims
+        self.embed_dims_in = embed_dims_in
+        self.embed_dims_out = embed_dims_out
 
         # Follow visual prompt
         # self.super_reductuion_dim = int(self.embed_dims/8)
@@ -39,14 +42,14 @@ class AdapterSuper(nn.Module):
 
         print('adapter',self.super_reductuion_dim)
         if self.super_reductuion_dim > 0:
-            self.ln1 = nn.Linear(self.embed_dims, self.super_reductuion_dim)
+            self.ln1 = nn.Linear(self.embed_dims_in, self.super_reductuion_dim)
             self.activate = QuickGELU()
-            self.ln2 = nn.Linear(self.super_reductuion_dim, self.embed_dims)
+            self.ln2 = nn.Linear(self.super_reductuion_dim, self.embed_dims_out)
 
             self.init_weights()
             
             if self.add_adapter_gate:
-                self.adapter_gate = nn.Linear(self.embed_dims, 1)
+                self.adapter_gate = nn.Linear(self.embed_dims_in, 1)
                 # initialize gate with mean 0 and std 0.02
                 self.adapter_gate.weight.data.normal_(mean=0, std=0.02)
         
@@ -95,6 +98,7 @@ class AdapterSuper(nn.Module):
         if self.parallel_adapter:
             return out
         else:
+            # TODO: try to remove this redundant identity for sequential adapter
             return identity + out
         # seq adapter
         # return identity + out
