@@ -42,12 +42,42 @@ from timm.data import (
 from timm.models.helpers import build_model_with_cfg, named_apply, adapt_input_conv
 from timm.models.layers import PatchEmbed, Mlp, DropPath, trunc_normal_, lecun_normal_
 from timm.models.registry import register_model
+from timm.models.layers.helpers import to_2tuple
 
 from model.module.adapter_super import AdapterSuper
 
 _logger = logging.getLogger(__name__)
 
-torch.set_printoptions(threshold=150, edgeitems=4)
+torch.set_printoptions(threshold=30, edgeitems=1)
+
+
+class Mlp_SSF(nn.Module):
+    """ MLP as used in Vision Transformer, MLP-Mixer and related networks, including SSF
+    """
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        drop_probs = to_2tuple(drop)
+
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.drop1 = nn.Dropout(drop_probs[0])
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop2 = nn.Dropout(drop_probs[1])
+
+        self.ssf_scale_1, self.ssf_shift_1 = init_ssf_scale_shift(hidden_features)
+        self.ssf_scale_2, self.ssf_shift_2 = init_ssf_scale_shift(out_features)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = ssf_ada(x, self.ssf_scale_1, self.ssf_shift_1)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.fc2(x)
+        x = ssf_ada(x, self.ssf_scale_2, self.ssf_shift_2)
+        x = self.drop2(x)
+        return x
 
 def _cfg(url="", **kwargs):
     return {
@@ -282,6 +312,23 @@ default_cfgs = {
     ),
 }
 
+def init_ssf_scale_shift(dim):
+    scale = nn.Parameter(torch.ones(dim))
+    shift = nn.Parameter(torch.zeros(dim))
+
+    nn.init.normal_(scale, mean=1, std=.02)
+    nn.init.normal_(shift, std=.02)
+
+    return scale, shift
+
+def ssf_ada(x, scale, shift):
+    assert scale.shape == shift.shape
+    if x.shape[-1] == scale.shape[0]:
+        return x * scale + shift
+    elif x.shape[1] == scale.shape[0]:
+        return x * scale.view(1, -1, 1, 1) + shift.view(1, -1, 1, 1)
+    else:
+        raise ValueError('the input tensor shape does not match the shape of the scale factor.')
 
 class Attention(nn.Module):
     def __init__(
@@ -297,6 +344,7 @@ class Attention(nn.Module):
         add_lora_gate=False,
         add_prefix_gate=False,
         add_router=False,
+        add_ssf=True,
     ):
         super().__init__()
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
@@ -312,16 +360,25 @@ class Attention(nn.Module):
 
         self.super_LoRA_dim = LoRA_dim
 
+        # ssf setting 
+        self.add_ssf = add_ssf
+        if self.add_ssf:
+            self.ssf_scale_1, self.ssf_shift_1 = init_ssf_scale_shift(dim * 3)
+            self.ssf_scale_2, self.ssf_shift_2 = init_ssf_scale_shift(dim)
+
         # gate setting
-        self.add_lora_gate = add_lora_gate
+        # self.add_lora_gate = add_lora_gate
+        self.add_lora_gate = False
         self.add_prefix_gate = add_prefix_gate
 
         # router setting
-        self.add_router = add_router
+        # self.add_router = add_router
+        self.add_router = True
+        
         self.at_num_module = 2  # LoRA , PATT (which is PA with Tanh)
         if self.add_router:
             self.router = nn.Sequential(
-                nn.Linear(dim, self.at_num_module * num_heads * 3), # 3 for q,k,v
+                nn.Linear(dim, self.at_num_module * num_heads * 3), # 3 for q,k,v or 2 for kv
                 # nn.Sigmoid(),
             )
             # initialize rounter with mean 0 and std 0.02
@@ -331,7 +388,7 @@ class Attention(nn.Module):
             self.Padapter = AdapterSuper(
                 embed_dims_in=dim,
                 embed_dims_out=dim*3,
-                reduction_dims=10,
+                reduction_dims=LoRA_dim,
                 drop_rate_adapter=0.1,
                 add_adapter_gate=False,
                 sequential_adapter=False,
@@ -339,14 +396,14 @@ class Attention(nn.Module):
             )
         
         # LoRA init
-        print("LoRA_dim", LoRA_dim)
+        # print("LoRA_dim", LoRA_dim)
         if LoRA_dim > 0:
             self.LoRA_a = nn.Linear(dim, LoRA_dim, bias=False)
             nn.init.kaiming_uniform_(self.LoRA_a.weight, a=math.sqrt(5))
             self.LoRA_b = nn.Linear(LoRA_dim, dim * 3, bias=False)
             nn.init.zeros_(self.LoRA_b.weight)
 
-            if add_lora_gate:
+            if self.add_lora_gate:
                 self.loRA_gate_q = nn.Linear(dim, num_heads)
                 self.loRA_gate_k = nn.Linear(dim, num_heads)
                 self.loRA_gate_v = nn.Linear(dim, num_heads)
@@ -408,11 +465,18 @@ class Attention(nn.Module):
     def forward(self, x):
         B, N, C = x.shape
 
-        qkv = (
-            self.qkv(x)
-            .reshape(B, N, 3, self.num_heads, C // self.num_heads)
-            .permute(2, 0, 3, 1, 4)
-        ) # 3 x B x num_heads x N x head_dim
+        if self.add_ssf:
+            qkv = (
+                ssf_ada(self.qkv(x), self.ssf_scale_1, self.ssf_shift_1)
+                .reshape(B, N, 3, self.num_heads, C // self.num_heads)
+                .permute(2, 0, 3, 1, 4)
+            ) # 3 x B x num_heads x N x head_dim
+        else:
+            qkv = (
+                self.qkv(x)
+                .reshape(B, N, 3, self.num_heads, C // self.num_heads)
+                .permute(2, 0, 3, 1, 4)
+            ) # 3 x B x num_heads x N x head_dim
         q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
         if self.LoRA_identity == False:
             # PETL starts here
@@ -494,7 +558,10 @@ class Attention(nn.Module):
             if self.add_router:
                 self.router_scaling = self.router(x) #shape (B,len_seq, num_module*num_heads*3)
                 # reshape softmax only on num_module
-                self.router_scaling = self.router_scaling.reshape(B, N, 3, self.num_heads, self.at_num_module).softmax(dim=-1)
+                # self.router_scaling = self.router_scaling.reshape(B, N, 3, self.num_heads, self.at_num_module).softmax(dim=-1)
+                self.router_scaling = self.router_scaling.reshape(B, N, 3, self.num_heads, self.at_num_module).sigmoid()
+                
+                
                 router_scaling_lora = self.router_scaling[:, :, :, : ,0] # shape (B, len_seq, 3, num_heads)
                 router_scaling_patt = self.router_scaling[:, :, :, : ,1] 
                 
@@ -509,14 +576,14 @@ class Attention(nn.Module):
                 router_scaling_patt = router_scaling_patt.reshape(B, N, self.num_heads, 3).transpose(1, 2)
                 
                 # mean gate for each gate
-                router_scaling_lora = router_scaling_lora.mean(dim=2, keepdim=True) # shape (B,Head,1,3)
-                router_scaling_patt = router_scaling_patt.mean(dim=2, keepdim=True)
+                # router_scaling_lora = router_scaling_lora.mean(dim=2, keepdim=True) # shape (B,Head,1,3)
+                # router_scaling_patt = router_scaling_patt.mean(dim=2, keepdim=True)
                 
-                print('SOFTMAX rounter scailing shape ', router_scaling_lora[:, :, :, 0].shape, "q_delta_lora shape", q_delta_lora.shape)
-                print("router scailing lora for q", router_scaling_lora[:, :, :, 0].max().item(), router_scaling_lora[:, :, :, 0].min().item(), router_scaling_lora[:, :, :, 0].squeeze(-1).squeeze(-1))
-                print("router scailing patt for q", router_scaling_patt[:, :, :, 0].max().item(), router_scaling_patt[:, :, :, 0].min().item(), router_scaling_patt[:, :, :, 0].squeeze(-1).squeeze(-1))
-                # print("router scailing lora for k", router_scaling_lora[:, :, :, 1].max().item(), router_scaling_lora[:, :, :, 1].min().item(), router_scaling_lora[:, :, :, 1].squeeze(-1).squeeze(-1))
-                # print("router scailing patt for k", router_scaling_patt[:, :, :, 1].max().item(), router_scaling_patt[:, :, :, 1].min().item(), router_scaling_patt[:, :, :, 1].squeeze(-1).squeeze(-1))
+                # print('SOFTMAX rounter scailing shape ', router_scaling_lora[:, :, :, 0].shape, "q_delta_lora shape", q_delta_lora.shape)
+                # print("router scailing lora for q", router_scaling_lora[:, :, :, 0].max().item(), router_scaling_lora[:, :, :, 0].min().item(), router_scaling_lora[:, :, :, 0].squeeze(-1).squeeze(-1))
+                # print("router scailing patt for q", router_scaling_patt[:, :, :, 0].max().item(), router_scaling_patt[:, :, :, 0].min().item(), router_scaling_patt[:, :, :, 0].squeeze(-1).squeeze(-1))
+                print("router scailing lora for k", router_scaling_lora[:, :, :, 1].max().item(), router_scaling_lora[:, :, :, 1].min().item(), router_scaling_lora[:, :, :, 1].squeeze(-1).squeeze(-1))
+                print("router scailing patt for k", router_scaling_patt[:, :, :, 1].max().item(), router_scaling_patt[:, :, :, 1].min().item(), router_scaling_patt[:, :, :, 1].squeeze(-1).squeeze(-1))
                 # print("router scailing lora for v", router_scaling_lora[:, :, :, 2].max().item(), router_scaling_lora[:, :, :, 2].min().item(), router_scaling_lora[:, :, :, 2].squeeze(-1).squeeze(-1))
                 # print("router scailing patt for v", router_scaling_patt[:, :, :, 2].max().item(), router_scaling_patt[:, :, :, 2].min().item(), router_scaling_patt[:, :, :, 2].squeeze(-1).squeeze(-1))
                 q_delta_lora, k_delta_lora, v_delta_lora = (
@@ -532,7 +599,7 @@ class Attention(nn.Module):
                 )
                 
                 q_delta, k_delta, v_delta = (
-                    q_delta_lora + q_delta_patt,
+                    q_delta_lora, # q_delta_patt
                     k_delta_lora + k_delta_patt,
                     v_delta_lora + v_delta_patt,
                 )
@@ -543,7 +610,7 @@ class Attention(nn.Module):
             prefix_weight_key = self.prefix_weight_key.expand(B, -1, -1)
             prefix_weight_value = self.prefix_weight_value.expand(B, -1, -1)
             if self.add_prefix_gate:
-                print("prefix_gate called")
+                # print("prefix_gate called")
                 self.prefix_scaling = torch.sigmoid(self.prefix_gate(x))
                 prefix_weight_key, prefix_weight_value = (
                     prefix_weight_key * self.prefix_scaling,
@@ -559,8 +626,11 @@ class Attention(nn.Module):
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
+        if self.add_ssf:
+            x = ssf_ada(x, self.ssf_scale_2, self.ssf_shift_2)
         x = self.proj_drop(x)
         return x
+
 
 
 class Block(nn.Module):
@@ -591,6 +661,7 @@ class Block(nn.Module):
         parallel_adapter=False,
         current_layer=0,
         add_router=False,
+        add_ssf=True,
     ):
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -611,44 +682,84 @@ class Block(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(
-            in_features=dim,
-            hidden_features=mlp_hidden_dim,
-            act_layer=act_layer,
-            drop=drop,
-        )
+        
+        if add_ssf:
+             self.mlp = Mlp_SSF(
+                in_features=dim,
+                hidden_features=mlp_hidden_dim,
+                act_layer=act_layer,
+                drop=drop,
+             )
+        else:
+            self.mlp = Mlp(
+                in_features=dim,
+                hidden_features=mlp_hidden_dim,
+                act_layer=act_layer,
+                drop=drop,
+            )
+            
 
         # gate setting
         self.add_vpt_gate = add_vpt_gate
-        self.add_adapter_gate = add_adapter_gate
+        # self.add_adapter_gate = add_adapter_gate
+        self.add_adapter_gate = False
 
         # router setting
-        self.ffn_num_module = 3  # LoRA, PA, SA ()
-        self.add_router = add_router
+        self.ffn_num_module = 6  # LoRA, PA, SA () #9
+        # self.add_router = add_router
+        self.add_router = True
         if self.add_router:
             self.router = nn.Sequential(
                 nn.Linear(dim, self.ffn_num_module),
-                nn.Softmax(dim=-1),
+                # nn.Softmax(dim=-1),
                 # or sigmoid
-                # nn.Sigmoid(),
+                nn.Sigmoid(),
             )
             # initialize rounter with mean 0 and std 0.02
             nn.init.normal_(self.router[0].weight, std=0.02, mean=0)
             # adapter setting
-            self.Sadapter = AdapterSuper(
-                embed_dims_in=dim,
-                embed_dims_out=dim,
-                reduction_dims=adapter_dim,
-                drop_rate_adapter=drop_rate_adapter,
-                add_adapter_gate=False,
-                sequential_adapter=True,
-                parallel_adapter=False,
-            )
+            # self.Sadapter = AdapterSuper(
+            #     embed_dims_in=dim,
+            #     embed_dims_out=dim,
+            #     reduction_dims=adapter_dim,
+            #     drop_rate_adapter=drop_rate_adapter,
+            #     add_adapter_gate=False,
+            #     sequential_adapter=True,
+            #     parallel_adapter=False,
+            # )
             
-            self.Padapter = AdapterSuper(
+            # self.Padapter = AdapterSuper(
+            #     embed_dims_in=dim,
+            #     embed_dims_out=dim,
+            #     reduction_dims=adapter_dim,
+            #     drop_rate_adapter=drop_rate_adapter,
+            #     add_adapter_gate=False,
+            #     sequential_adapter=False,
+            #     parallel_adapter=True,
+            # )
+            
+            # # LoRA setting
+
+            # self.LoRA_a = nn.Linear(dim, adapter_dim, bias=False)
+            # nn.init.kaiming_uniform_(self.LoRA_a.weight, a=math.sqrt(5))
+            # self.LoRA_b = nn.Linear(adapter_dim, dim, bias=False)
+            # nn.init.zeros_(self.LoRA_b.weight)
+            # self.LoRA_drop = nn.Dropout(p=drop_rate_LoRA)
+            
+            self.Sadapter_10 = AdapterSuper(
+                    embed_dims_in=dim,
+                    embed_dims_out=dim,
+                    reduction_dims=10,
+                    drop_rate_adapter=drop_rate_adapter,
+                    add_adapter_gate=False,
+                    sequential_adapter=True,
+                    parallel_adapter=False,
+                )
+                
+            self.Padapter_10 = AdapterSuper(
                 embed_dims_in=dim,
                 embed_dims_out=dim,
-                reduction_dims=adapter_dim,
+                reduction_dims=10,
                 drop_rate_adapter=drop_rate_adapter,
                 add_adapter_gate=False,
                 sequential_adapter=False,
@@ -656,14 +767,73 @@ class Block(nn.Module):
             )
             
             # LoRA setting
-
-            self.LoRA_a = nn.Linear(dim, adapter_dim, bias=False)
-            nn.init.kaiming_uniform_(self.LoRA_a.weight, a=math.sqrt(5))
-            self.LoRA_b = nn.Linear(adapter_dim, dim, bias=False)
-            nn.init.zeros_(self.LoRA_b.weight)
+            self.LoRA_a_10 = nn.Linear(dim, 10, bias=False)
+            nn.init.kaiming_uniform_(self.LoRA_a_10.weight, a=math.sqrt(5))
+            self.LoRA_b_10 = nn.Linear(10, dim, bias=False)
+            nn.init.zeros_(self.LoRA_b_10.weight)
+            self.LoRA_drop = nn.Dropout(p=drop_rate_LoRA)
+            
+            self.Sadapter_5 = AdapterSuper(
+                embed_dims_in=dim,
+                embed_dims_out=dim,
+                reduction_dims=5,
+                drop_rate_adapter=drop_rate_adapter,
+                add_adapter_gate=False,
+                sequential_adapter=True,
+                parallel_adapter=False,
+            )
+            
+            self.Padapter_5 = AdapterSuper(
+                embed_dims_in=dim,
+                embed_dims_out=dim,
+                reduction_dims=5,
+                drop_rate_adapter=drop_rate_adapter,
+                add_adapter_gate=False,
+                sequential_adapter=False,
+                parallel_adapter=True,
+            )
+            
+            # LoRA setting
+            self.LoRA_a_5 = nn.Linear(dim, 5, bias=False)
+            nn.init.kaiming_uniform_(self.LoRA_a_5.weight, a=math.sqrt(5))
+            self.LoRA_b_5 = nn.Linear(5, dim, bias=False)
+            nn.init.zeros_(self.LoRA_b_5.weight)
+            self.LoRA_drop = nn.Dropout(p=drop_rate_LoRA)
+            
+            self.Sadapter_1 = AdapterSuper(
+                embed_dims_in=dim,
+                embed_dims_out=dim,
+                reduction_dims=1,
+                drop_rate_adapter=drop_rate_adapter,
+                add_adapter_gate=False,
+                sequential_adapter=True,
+                parallel_adapter=False,
+            )
+            
+            self.Padapter_1 = AdapterSuper(
+                embed_dims_in=dim,
+                embed_dims_out=dim,
+                reduction_dims=1,
+                drop_rate_adapter=drop_rate_adapter,
+                add_adapter_gate=False,
+                sequential_adapter=False,
+                parallel_adapter=True,
+            )
+            
+            # LoRA setting
+            self.LoRA_a_1 = nn.Linear(dim, 1, bias=False)
+            nn.init.kaiming_uniform_(self.LoRA_a_5.weight, a=math.sqrt(5))
+            self.LoRA_b_1 = nn.Linear(1, dim, bias=False)
+            nn.init.zeros_(self.LoRA_b_5.weight)
+            self.LoRA_drop = nn.Dropout(p=drop_rate_LoRA)
+            
+            
+            
+            
 
         # adapter setting
-        self.sequential_adapter = sequential_adapter
+        # self.sequential_adapter = sequential_adapter
+        self.sequential_adapter = True
         self.parallel_adapter = parallel_adapter
         if self.add_adapter_gate:
             self.adapter = AdapterSuper(
@@ -724,11 +894,23 @@ class Block(nn.Module):
         if self.add_adapter_gate:
             self.adapter.set_sample_config(sample_embed_dim=self.sample_adapter_dim)
         if self.add_router:
-            self.Sadapter.set_sample_config(sample_embed_dim=self.sample_adapter_dim)
-            self.Padapter.set_sample_config(sample_embed_dim=self.sample_adapter_dim)
-            self.LoRA_a_weight = self.LoRA_a.weight[: self.sample_adapter_dim, :]
-            self.LoRA_b_weight = self.LoRA_b.weight[:, : self.sample_adapter_dim]
-
+            # self.Sadapter.set_sample_config(sample_embed_dim=self.sample_adapter_dim)
+            # self.Padapter.set_sample_config(sample_embed_dim=self.sample_adapter_dim)
+            # self.LoRA_a_weight = self.LoRA_a.weight[: self.sample_adapter_dim, :]
+            # self.LoRA_b_weight = self.LoRA_b.weight[:, : self.sample_adapter_dim]
+            
+            self.Sadapter_10.set_sample_config(sample_embed_dim=10) 
+            self.Padapter_10.set_sample_config(sample_embed_dim=10)
+            self.LoRA_a_weight_10 = self.LoRA_a_10.weight[:10, :] 
+            self.LoRA_b_weight_10 = self.LoRA_b_10.weight[:, :10]
+            self.Sadapter_5.set_sample_config(sample_embed_dim=5)
+            self.Padapter_5.set_sample_config(sample_embed_dim=5)
+            self.LoRA_a_weight_5 = self.LoRA_a_5.weight[:5, :]
+            self.LoRA_b_weight_5 = self.LoRA_b_5.weight[:, :5]
+            self.Sadapter_1.set_sample_config(sample_embed_dim=1) 
+            self.Padapter_1.set_sample_config(sample_embed_dim=1)
+            self.LoRA_a_weight_1 = self.LoRA_a_1.weight[:1, :]
+            self.LoRA_b_weight_1 = self.LoRA_b_1.weight[:, :1]
         
 
     def calc_sampled_param_num(self):
@@ -798,26 +980,92 @@ class Block(nn.Module):
             x_after_ffn = self.drop_path(self.mlp(self.norm2(x_before_ffn)))
             router_scaling = self.router(x_before_ffn) #shape (B,len_seq, num_module)
             # comment out mean for softmax
-            # router_scaling = router_scaling.mean(dim=1, keepdim=True) # shape (B,1,num_module)
-            delta_sa = self.Sadapter(x_after_ffn)
-            delta_pa = self.Padapter(x)
-            delta_lora = F.linear(self.LoRA_a(x), self.LoRA_b.weight)
-            delta_sa, delta_pa, delta_lora = (
-                delta_sa * router_scaling[:, :, 0].unsqueeze(-1),
-                delta_pa * router_scaling[:, :, 1].unsqueeze(-1),
-                delta_lora * router_scaling[:, :, 2].unsqueeze(-1),
+            router_scaling = router_scaling.mean(dim=1, keepdim=True) # shape (B,1,num_module)
+            # delta_sa = self.Sadapter(x_after_ffn)
+            # delta_pa = self.Padapter(x)
+            # delta_lora= F.linear(self.LoRA_drop(x), self.LoRA_a_weight)
+            # delta_lora = F.linear(delta_lora, self.LoRA_b_weight)
+            
+            delta_sa_10 = self.Sadapter_10(x_after_ffn)
+            delta_pa_10 = self.Padapter_10(x)
+            # delta_lora_10= F.linear(self.LoRA_drop(x), self.LoRA_a_weight_10)
+            # delta_lora_10 = F.linear(delta_lora_10, self.LoRA_b_weight_10)
+            
+            delta_sa_5 = self.Sadapter_5(x_after_ffn)
+            delta_pa_5 = self.Padapter_5(x)
+            # delta_lora_5= F.linear(self.LoRA_drop(x), self.LoRA_a_weight_5)
+            # delta_lora_5 = F.linear(delta_lora_5, self.LoRA_b_weight_5)
+            
+            delta_sa_1 = self.Sadapter_1(x_after_ffn)
+            delta_pa_1 = self.Padapter_1(x)
+            # delta_lora_1= F.linear(self.LoRA_drop(x), self.LoRA_a_weight_1)
+            # delta_lora_1 = F.linear(delta_lora_1, self.LoRA_b_weight_1)
+            
+            
+            
+            # delta_sa, delta_pa, delta_lora = (
+            #     delta_sa * router_scaling[:, :, 0].unsqueeze(-1),
+            #     delta_pa * router_scaling[:, :, 1].unsqueeze(-1),
+            #     delta_lora * router_scaling[:, :, 2].unsqueeze(-1),
+            # )
+            
+            # delta_sa_10, delta_pa_10, delta_lora_10 = (
+            #     delta_sa_10 * router_scaling[:, :, 0].unsqueeze(-1),
+            #     delta_pa_10 * router_scaling[:, :, 1].unsqueeze(-1),
+            #     delta_lora_10 * router_scaling[:, :, 2].unsqueeze(-1),
+            # )
+
+            # delta_sa_5, delta_pa_5, delta_lora_5 = (
+            #     delta_sa_5 * router_scaling[:, :, 3].unsqueeze(-1),
+            #     delta_pa_5 * router_scaling[:, :, 4].unsqueeze(-1),
+            #     delta_lora_5 * router_scaling[:, :, 5].unsqueeze(-1),
+            # )
+
+            # delta_sa_1, delta_pa_1, delta_lora_1 = (
+            #     delta_sa_1 * router_scaling[:, :, 6].unsqueeze(-1),
+            #     delta_pa_1 * router_scaling[:, :, 7].unsqueeze(-1),
+            #     delta_lora_1 * router_scaling[:, :, 8].unsqueeze(-1),
+            # )
+            
+            delta_sa_10, delta_pa_10 = (
+                delta_sa_10 * router_scaling[:, :, 0].unsqueeze(-1),
+                delta_pa_10 * router_scaling[:, :, 1].unsqueeze(-1),
             )
-            print("rounter scailing for sa", delta_sa.shape, router_scaling[:, :, 0].unsqueeze(-1).shape, router_scaling[:, :, 0].max().item(), router_scaling[:, :, 0].min().item(), router_scaling[:, :, 0].squeeze(-1).squeeze(-1))
-            print("rounter scailing for pa", router_scaling[:, :, 1].max().item(), router_scaling[:, :, 1].min().item(), router_scaling[:, :, 1].squeeze(-1).squeeze(-1))
-            print("rounter scailing for lora", router_scaling[:, :, 2].max().item(), router_scaling[:, :, 2].min().item(), router_scaling[:, :, 2].squeeze(-1).squeeze(-1))
-            x = x_before_ffn + delta_sa + delta_pa + delta_lora
+
+            delta_sa_5, delta_pa_5 = (
+                delta_sa_5 * router_scaling[:, :, 2].unsqueeze(-1),
+                delta_pa_5 * router_scaling[:, :, 3].unsqueeze(-1),
+            )
+
+            delta_sa_1, delta_pa_1 = (
+                delta_sa_1 * router_scaling[:, :, 4].unsqueeze(-1),
+                delta_pa_1 * router_scaling[:, :, 5].unsqueeze(-1),
+            )
+            
+            
+
+            
+            print("rounter scailing for delta_sa_10", delta_sa_10.shape, router_scaling[:, :, 0].unsqueeze(-1).shape, router_scaling[:, :, 0].max().item(), router_scaling[:, :, 0].min().item(), router_scaling[:, :, 0].squeeze(-1).squeeze(-1))
+            # print("rounter scailing for sa", delta_sa.shape, router_scaling[:, :, 0].unsqueeze(-1).shape, router_scaling[:, :, 0].max().item(), router_scaling[:, :, 0].min().item(), router_scaling[:, :, 0].squeeze(-1).squeeze(-1))
+            # print("rounter scailing for pa", router_scaling[:, :, 1].max().item(), router_scaling[:, :, 1].min().item(), router_scaling[:, :, 1].squeeze(-1).squeeze(-1))
+            # print("rounter scailing for lora", router_scaling[:, :, 2].max().item(), router_scaling[:, :, 2].min().item(), router_scaling[:, :, 2].squeeze(-1).squeeze(-1))
+            # x = x_before_ffn + x_after_ffn + delta_sa + delta_pa + delta_lora
+            
+            # x = x_before_ffn + x_after_ffn + delta_sa_10 + delta_pa_10 + delta_lora_10
+            # x += delta_sa_5 + delta_pa_5 + delta_lora_5
+            # x += delta_sa_1 + delta_pa_1 + delta_lora_1
+            
+            x = x_before_ffn + x_after_ffn + delta_sa_10 + delta_pa_10 
+            x += delta_sa_5 + delta_pa_5 
+            x += delta_sa_1 + delta_pa_1
             
         elif self.parallel_adapter:
             delta_adapter = self.adapter(x)
             x = x + self.drop_path(self.mlp(self.norm2(x))) + delta_adapter
         else:
             # sequntial adapter
-            x = x + self.adapter(self.drop_path(self.mlp(self.norm2(x))))
+            x_after_ffn = self.drop_path(self.mlp(self.norm2(x)))
+            x = x + x_after_ffn +self.adapter(x_after_ffn)
 
         return x
 
@@ -1024,21 +1272,21 @@ class VisionTransformer(nn.Module):
                 block.attn.LoRA_drop.train()
                 
                 # attn PATT setting
-                if self.add_router:
-                    block.attn.Padapter.train()
+                # if self.add_router:
+                #     block.attn.Padapter.  train()
                 
             block.drop_prompt.train()
 
-            if self.super_adapter_dim > 0:
-                if self.add_router:
-                    block.Padapter.train()
-                    block.Sadapter.train()
+            # if self.super_adapter_dim > 0:
+            #     if self.add_router:
+            #         block.Padapter.train()
+            #         block.Sadapter.train()
                     
-                    # ffn lora setting
-                    block.LoRA_a.train()
-                    block.LoRA_b.train()
-                else:
-                    block.adapter.train()
+            #         # ffn lora setting
+            #         block.LoRA_a.train()
+            #         block.LoRA_b.train()
+            #     else:
+            #         block.adapter.train()
 
             if self.super_prefix_dim > 0:
                 block.attn.prefix_drop.train()
@@ -1052,6 +1300,7 @@ class VisionTransformer(nn.Module):
                 and "head" not in name
                 and "gate" not in name
                 and "router" not in name
+                and "ssf" not in name
             ):
                 param.requires_grad = False
 

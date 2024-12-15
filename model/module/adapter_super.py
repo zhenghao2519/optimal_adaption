@@ -77,7 +77,7 @@ class AdapterSuper(nn.Module):
             self.sampled_bias_1 =  self.ln2.bias
 
 
-    def forward(self, x, identity=None):
+    def forward(self, x, identity=False):
         if self.identity:
             # import pdb;pdb.set_trace()
             return x
@@ -99,7 +99,8 @@ class AdapterSuper(nn.Module):
             return out
         else:
             # TODO: try to remove this redundant identity for sequential adapter
-            return identity + out
+            # return identity + out
+            return out
         # seq adapter
         # return identity + out
         # parallel adapter
